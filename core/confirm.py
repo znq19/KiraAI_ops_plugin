@@ -31,6 +31,9 @@ class ConfirmPool:
         token = secrets.token_hex(self.TOKEN_BYTES)
         record = {
             "token": token,
+            # 4-hex public label for the challenge message; NOT a secret,
+            # it only tells several pending requests apart.
+            "code": secrets.token_hex(2),
             "created": time.time(),
             "expires": time.time() + self.ttl,
             "sid": str(sid or ""),
@@ -39,6 +42,15 @@ class ConfirmPool:
         }
         self._pending[token] = record
         return record
+
+    def latest(self) -> dict:
+        """Newest non-expired pending record (or {}). Used by the DM approval
+        channel, which approves the most recent request when the plain
+        password arrives in the confirm session."""
+        self._gc()
+        if not self._pending:
+            return {}
+        return max(self._pending.values(), key=lambda r: r["created"])
 
     def peek(self, token: str) -> dict:
         self._gc()

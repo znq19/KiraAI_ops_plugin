@@ -29,11 +29,20 @@
       readonly: '只读名单 readonly_sessions', readonlyHint: '名单内会话只能读，写操作一律拒绝',
       enabled: '启用插件', panicLock: '全锁（紧急只读）',
       legendRisk: '风险分级',
-      level: '能力档位', levelHint: 'readonly=只读；standard=常规（默认）；dangerous=高危需确认；full=全开',
-      highActions: '高危动作清单', highActionsHint: '每行一个动作键，如 plugin.uninstall',
+      level: '能力档位', levelHint: 'readonly=只读；standard=常规（默认，含安装/升级）；超档可密码授权；dangerous=高危名单+令牌；full=全开',
+      highActions: '超档（高危）动作清单', highActionsHint: '每行一个动作键，如 plugin.uninstall；standard 下可经密码授权执行',
       highSessions: '高危会话名单（必填，不继承）',
       highSessionsHint: '只有名单内的会话能执行高危动作；留空 = 无人可执行（安全默认）',
       requireConfirm: '高危动作需确认令牌', confirmTtl: '确认令牌有效期（秒）', default300: '默认 300',
+      legendDm: '密码确认授权（超档动作的批准通道）',
+      dmEnabled: '启用密码确认授权',
+      dmSession: '确认会话（可多个，任一批准即可）',
+      dmSessionHint: '每行一个 adapter:dm:QQ号 或 adapter:gm:群号；同时发送，任一回复密码即批准。⚠️ 群里密码会以明文出现，建议私聊',
+      dmPassword: '确认密码', dmPasswordHint: '在任一确认会话直接发此密码即批准；留空不变，永不回显原值',
+      dmTplReq: '确认请求提示语模板', dmTplPh: '密码占位符（无待确认时）', dmTplAck: '批准回执模板', dmTplNotice: '原会话通知模板',
+      dmTplHint: '占位符：请求 {sid} {uid} {action} {params} {ttl} {code}；回执/通知 {action} {result} {code}',
+      dmStateReady: '状态：已就绪（超档动作触发时会向确认会话发授权请求）',
+      dmStateOff: '状态：未启用', dmStateBad: '状态：已启用但未配齐（至少一个确认会话 + 密码）',
       legendControl: '重启与关机（默认双关，互不牵连）',
       allowRestart: '允许重启 KiraAI', allowShutdown: '允许关闭 KiraAI',
       controlHint: '仍需 full 档位 + 确认令牌',
@@ -85,12 +94,21 @@
       readonly: 'Read-only list (readonly_sessions)', readonlyHint: 'These sessions may read but never write',
       enabled: 'Plugin enabled', panicLock: 'Panic lock (read-only)',
       legendRisk: 'Risk ladder',
-      level: 'Capability level', levelHint: 'readonly / standard (default) / dangerous (confirm) / full',
-      highActions: 'High-risk actions', highActionsHint: 'One action key per line, e.g. plugin.uninstall',
+      level: 'Capability level', levelHint: 'readonly / standard (default, incl. install+update) / over-level actions can be DM-approved / dangerous (list+token) / full',
+      highActions: 'Over-level (high-risk) actions', highActionsHint: 'One action key per line; at standard these can be authorized via the DM password',
       highSessions: 'High-risk sessions (required, not inherited)',
       highSessionsHint: 'Only these sessions may run high-risk actions; empty = nobody (safe default)',
       requireConfirm: 'High-risk actions need a confirm token', confirmTtl: 'Confirm token TTL (seconds)',
       default300: 'default 300',
+      legendDm: 'Password approval channel (for over-level actions)',
+      dmEnabled: 'Enable password approval',
+      dmSession: 'Confirm sessions (several allowed; first password wins)',
+      dmSessionHint: 'one adapter:dm:<id> or adapter:gm:<id> per line; all are notified at once. Groups expose the password - prefer DMs',
+      dmPassword: 'Approval password', dmPasswordHint: 'send this exact text in any confirm session to approve; blank keeps the old value, never echoed back',
+      dmTplReq: 'Challenge message template', dmTplPh: 'Password placeholder (nothing pending)', dmTplAck: 'Approval ack template', dmTplNotice: 'Origin-session notice template',
+      dmTplHint: 'placeholders: request {sid} {uid} {action} {params} {ttl} {code}; ack/notice {action} {result} {code}',
+      dmStateReady: 'state: ready (a challenge is posted here for every high-risk request)',
+      dmStateOff: 'state: disabled', dmStateBad: 'state: enabled but incomplete (needs a dm session + password)',
       legendControl: 'Restart and shutdown (both off by default, independent)',
       allowRestart: 'Allow restarting KiraAI', allowShutdown: 'Allow shutting down KiraAI',
       controlHint: 'also needs level=full + a confirm token',
@@ -204,6 +222,37 @@
     return wrap
   }
 
+  function fieldPassword(path, label, hint) {
+    // write-only: the backend masks the stored value with '***', which is
+    // rendered as a placeholder; submitting empty/'***' keeps the old value
+    var wrap = el('label')
+    wrap.appendChild(el('span', 'k', label))
+    var input = el('input', '', '')
+    input.type = 'password'
+    input.autocomplete = 'new-password'
+    var v = getPath(cfg, path)
+    if (v) input.placeholder = v === '***' ? '(set - hidden)' : '(set)'
+    input.dataset.path = path
+    input.dataset.kind = 'password'
+    wrap.appendChild(input)
+    if (hint) wrap.appendChild(el('span', 'hint', hint))
+    return wrap
+  }
+
+  function fieldArea(path, label, hint) {
+    var wrap = el('label')
+    wrap.appendChild(el('span', 'k', label))
+    var input = el('textarea', '', '')
+    input.rows = 4
+    var v = getPath(cfg, path)
+    input.value = v == null ? '' : v
+    input.dataset.path = path
+    input.dataset.kind = 'text'
+    wrap.appendChild(input)
+    if (hint) wrap.appendChild(el('span', 'hint', hint))
+    return wrap
+  }
+
   function fieldSwitch(path, label, hint) {
     var wrap = el('label', 'switch')
     var input = el('input', '', '')
@@ -263,6 +312,11 @@
         else value = num
       }
       else if (kind === 'list') value = n.value.split('\n').map(function (s) { return s.trim() }).filter(Boolean)
+      else if (kind === 'password') {
+        // empty or the mask placeholder means "leave the stored password alone"
+        if (!n.value || n.value === '***') usable = false
+        else value = n.value
+      }
       else value = n.value
       if (usable) setPath(patch, path, value)
     })
@@ -356,6 +410,21 @@
     fs.appendChild(fieldSwitch('risk.require_confirm', t('requireConfirm')))
     fs.appendChild(fieldText('risk.confirm_ttl', t('confirmTtl'), t('default300'), 'number'))
     pane.appendChild(fs)
+
+    var st = (overview && overview.confirm) || {}
+    var stateText = st.ready ? t('dmStateReady') : (st.enabled ? t('dmStateBad') : t('dmStateOff'))
+    var fs2 = el('fieldset')
+    fs2.appendChild(el('legend', '', t('legendDm')))
+    var state = el('div', 'muted', stateText)
+    fs2.appendChild(state)
+    fs2.appendChild(fieldSwitch('confirm.enabled', t('dmEnabled')))
+    fs2.appendChild(fieldList('confirm.sessions', t('dmSession'), t('dmSessionHint')))
+    fs2.appendChild(fieldPassword('confirm.password', t('dmPassword'), t('dmPasswordHint')))
+    fs2.appendChild(fieldArea('confirm.template_request', t('dmTplReq'), t('dmTplHint')))
+    fs2.appendChild(fieldText('confirm.template_placeholder', t('dmTplPh'), t('dmTplHint')))
+    fs2.appendChild(fieldArea('confirm.template_approved', t('dmTplAck'), t('dmTplHint')))
+    fs2.appendChild(fieldArea('confirm.template_notice', t('dmTplNotice'), t('dmTplHint')))
+    pane.appendChild(fs2)
   }
 
   function renderControl() {

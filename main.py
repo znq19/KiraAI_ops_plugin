@@ -27,14 +27,17 @@ deployment.
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import json
+import secrets
 import time
 from pathlib import Path
 
 from core.plugin import BasePlugin, PageMenu, PluginPage, Priority, logger, on, register
 from core.chat import Session
-from core.chat.message_utils import KiraMessageBatchEvent
+from core.chat.message_elements import Text
+from core.chat.message_utils import KiraMessageBatchEvent, MessageChain
 from core.provider import LLMRequest
 from core.utils.path_utils import get_config_path, get_data_path
 
@@ -44,6 +47,7 @@ from .core.audit import AuditLog
 from .core.backup import BackupManager
 from .core.confirm import ConfirmPool
 from .core.permission import PermissionEngine
+from .core.redact import MASK
 from .store import StoreClient, PLUGIN_ID_RE
 from .store.installer import (
     install_plugin_from_direct_url,
@@ -51,6 +55,20 @@ from .store.installer import (
     install_skill_from_zip_bytes,
 )
 from core.prompt_manager import Prompt
+
+# Default texts for the DM password-confirmation channel. The schema carries
+# the same strings as field defaults; both are user-editable, these are only
+# the fallback when a template is missing or fails to format.
+DEFAULT_CONFIRM_REQUEST = (
+    "[kira_ops 高危确认 #{code}]\n"
+    "会话 {sid} 的用户 {uid} 请求执行高危动作：{action}\n"
+    "参数：{params}\n"
+    "如确认执行，请在 {ttl} 秒内于本会话直接回复【确认密码】"
+    "（只发密码本身，不要带其他文字）；不回复或超时即自动放弃。"
+)
+DEFAULT_CONFIRM_PLACEHOLDER = "[收到 Kira 运行自控台（kira_ops）确认密码，当前并无待确认请求]"
+DEFAULT_CONFIRM_APPROVED = "[kira_ops] 高危动作 {action} 已批准并执行：{result}"
+DEFAULT_CONFIRM_NOTICE = "[kira_ops 系统通知] 你先前请求的动作 {action} 已获管理员批准并已执行；结果：{result}。本通知仅供你参考，是否向用户说明由你决定。"
 
 # Plugins whose functionality kira_ops fully absorbs. When they are enabled,
 # kira_ops disables them (never uninstalls) so nothing double-registers.
@@ -110,6 +128,20 @@ def wrap_tool_results(cls):
 class KiraOpsPlugin(BasePlugin):
     plugin_id = "kira_ops"
 
+    # 1.1.0's materialized high-risk default list. 1.2.0 moves plugin/store
+    # install+update out of the defaults; configs saved by 1.1.0 carry this
+    # exact list and are migrated (customized lists are left untouched).
+    OLD_DEFAULT_HIGH_RISK = frozenset({
+        "plugin.uninstall", "plugin.disable", "plugin.install", "plugin.update",
+        "skill.remove", "skill.install",
+        "provider.delete_model", "provider.update_model", "provider.sync", "mcp.delete",
+        "session.delete", "session.memory_clear",
+        "persona.create", "persona.update", "persona.delete", "persona.set_active",
+        "store.install", "store.update", "backup.restore",
+    })
+    INSTALL_ACTIONS = frozenset({"plugin.install", "plugin.update",
+                                 "store.install", "store.update"})
+
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
         self.cfg = cfg or {}
@@ -142,6 +174,7 @@ class KiraOpsPlugin(BasePlugin):
         self.backup_cfg = (cfg or {}).get("backup") or {}
         self.audit_cfg = (cfg or {}).get("audit") or {}
         self.store_cfg = (cfg or {}).get("store") or {}
+        self.confirm_cfg = (cfg or {}).get("confirm") or {}
 
     def _resolve_data_dir(self) -> Path:
         try:
@@ -483,10 +516,44 @@ class KiraOpsPlugin(BasePlugin):
             removed_audit = await asyncio.to_thread(self.audit.cleanup)
             self.log(f"startup cleanup: backups removed={stats.get('removed', 0)}, "
                      f"audit files removed={removed_audit}")
+        self._migrate_high_risk_defaults()
         self._check_mandatory_settings()
         if bool(self.store_cfg.get("takeover_store", True)):
             await self._takeover_store()
         self.log("ready: tools + panel registered")
+
+    def _migrate_high_risk_defaults(self) -> None:
+        """Persist the 1.2.0 high-risk default change into old configs.
+
+        1.1.0 materialized the old default list into every saved config, so a
+        schema-default change alone never reaches existing users. Only lists
+        that still equal the old default exactly are migrated; customized
+        lists are respected as-is.
+        """
+        saved = self.risk.get("high_risk_actions") or []
+        if {str(x) for x in saved} != self.OLD_DEFAULT_HIGH_RISK:
+            return
+        migrated = [str(x) for x in saved if str(x) not in self.INSTALL_ACTIONS]
+        self.log("migrating high-risk defaults: plugin/store install+update are no "
+                 "longer high-risk (usable at standard level)")
+        try:
+            cfg_file = get_config_path() / "plugins" / f"{self.plugin_id}.json"
+            data = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.is_file() else {}
+            data.setdefault("risk", {})["high_risk_actions"] = migrated
+            cfg_file.parent.mkdir(parents=True, exist_ok=True)
+            cfg_file.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"[kira_ops] high-risk default migration could not persist: {exc}")
+        try:
+            cached = (getattr(getattr(self.ctx, "plugin_mgr", None), "plugin_configs", None)
+                      or {}).get(self.plugin_id)
+            if isinstance(cached, dict):
+                cached.setdefault("risk", {})["high_risk_actions"] = migrated
+        except Exception:
+            pass
+        self.cfg.setdefault("risk", {})["high_risk_actions"] = migrated
+        self.risk["high_risk_actions"] = migrated
+        self.engine.apply_settings(self.cfg)
 
     async def terminate(self):
         for task in list(self.tasks):
@@ -497,11 +564,17 @@ class KiraOpsPlugin(BasePlugin):
 
     def _check_mandatory_settings(self):
         """Recompute the standing warnings; log each distinct one only once."""
+        confirm_enabled = bool(self.confirm_cfg.get("enabled", False))
         checks = (
-            (not (self.risk.get("high_risk_sessions") or []),
-             "高危名单为空：无人可执行高危动作（安全默认，非故障）"),
+            (not (self.risk.get("high_risk_sessions") or []) and not self._confirm_ready(),
+             "高危名单为空且密码确认未就绪：超档动作当前无人可执行（安全默认，非故障）"),
             (not self.protected.get("persona_write", False),
              "人设只读（protected.persona_write=false）"),
+            (confirm_enabled and not self._confirm_sessions(),
+             "密码确认已启用但没有可用的确认会话（每行一个 adapter:dm:QQ号 或 adapter:gm:群号），该通道当前不可用"),
+            (confirm_enabled and self._confirm_sessions()
+             and not str(self.confirm_cfg.get("password") or ""),
+             "密码确认已启用但未设置确认密码，该通道当前不可用"),
         )
         self.warnings = [message for active, message in checks if active]
         for message in self.warnings:
@@ -559,6 +632,254 @@ class KiraOpsPlugin(BasePlugin):
                 p.content += text
                 return
         req.system_prompt.append(Prompt(text.strip(), name="chat_env", source="kira_ops"))
+
+
+    # ------------------------------------------------------------------
+    # Password confirmation channel (multi-session)
+    # ------------------------------------------------------------------
+    # Flow: a high-risk / over-level action issues the usual pending record
+    # AND, when confirm.enabled is on, mechanically posts a challenge to
+    # every configured confirm session (dm or gm, several allowed at once).
+    # Replying with the plain password in ANY of them within the TTL
+    # approves the most recent pending request: that message is stopped in
+    # the hook below, so it never reaches the buffer or the LLM. Anything
+    # else in those sessions passes through untouched.
+
+    def _spawn(self, coro) -> None:
+        """Fire-and-forget a coroutine on the running loop, tracked for terminate()."""
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            return
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def _confirm_sessions(self) -> list:
+        """Configured confirm sessions, filtered to valid `adapter:dm|gm:id` ids."""
+        raw = self.confirm_cfg.get("sessions") or []
+        if isinstance(raw, str):  # tolerate a single string
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple, set)):
+            # a dict/int/bool here (the model can write config) must not crash
+            return []
+        out = []
+        for item in raw:
+            s = str(item or "").strip()
+            parts = s.split(":")
+            if len(parts) == 3 and parts[1] in ("dm", "gm") and parts[0] and parts[2]:
+                out.append(s)
+        return out
+
+    def _confirm_ready(self) -> bool:
+        """True only when the password channel is fully configured."""
+        if not bool(self.confirm_cfg.get("enabled", False)):
+            return False
+        if not self._confirm_sessions():
+            return False
+        return bool(str(self.confirm_cfg.get("password") or ""))
+
+    def _confirm_status(self) -> dict:
+        sessions = self._confirm_sessions()
+        return {
+            "enabled": bool(self.confirm_cfg.get("enabled", False)),
+            "sessions": len(sessions),
+            "password_set": bool(str(self.confirm_cfg.get("password") or "")),
+            "ready": self._confirm_ready(),
+        }
+
+    def _render_tpl(self, key: str, default: str, **kw) -> str:
+        tpl = str(self.confirm_cfg.get(key) or "").strip() or default
+        try:
+            return tpl.format(**kw)
+        except Exception:
+            try:
+                return default.format(**kw)
+            except Exception:
+                return default
+
+    async def _confirm_send(self, session: str, text: str) -> bool:
+        """Mechanically post a message to a confirm session (no LLM involved)."""
+        try:
+            await self.ctx.send_message_chain(session, MessageChain([Text(text)]))
+            return True
+        except Exception as exc:
+            logger.warning(f"[kira_ops] confirm message to {session} failed: {exc}")
+            return False
+
+    async def _send_confirm_challenge(self, record: dict) -> None:
+        """Post the challenge to ALL confirm sessions at once; the first
+        password reply in any of them wins."""
+        request = record.get("request") or {}
+        try:
+            preview = json.dumps(self.mask(request.get("params") or {}), ensure_ascii=False)
+        except Exception:
+            preview = "{}"
+        if len(preview) > 200:
+            preview = preview[:200] + "…"
+        action = str(request.get("key") or f"{request.get('cap')}.{request.get('action')}")
+        text = self._render_tpl(
+            "template_request", DEFAULT_CONFIRM_REQUEST,
+            sid=record.get("sid") or "?", uid=record.get("uid") or "?",
+            action=action, params=preview, ttl=self.confirm.ttl,
+            code=record.get("code") or "?")
+        sent = 0
+        for session in self._confirm_sessions():
+            if await self._confirm_send(session, text):
+                sent += 1
+        self.log(f"confirm challenge #{record.get('code')} sent to {sent} session(s)")
+
+    @on.im_message(priority=90)
+    async def confirm_password_hook(self, event):
+        """Consume the plain password in ANY confirm session and approve.
+
+        Priority 90 sits above the builtin chat plugin (HIGH=50) so the
+        password is swallowed before any chat logic sees it; event.stop()
+        keeps it out of the buffer and away from the LLM entirely. The
+        approval executes in a spawned task: this hook runs under the
+        message-processing semaphore, so a long action must not live here.
+        """
+        if not self._confirm_ready():
+            return
+        try:
+            sid = str(getattr(getattr(event, "session", None), "sid", "") or "")
+        except Exception:
+            return
+        if sid not in self._confirm_sessions():
+            return
+        password = str(self.confirm_cfg.get("password") or "")
+        try:
+            chain = getattr(getattr(event, "message", None), "chain", None)
+            text = "".join(
+                str(getattr(el, "text", "") or "")
+                for el in (chain or []) if isinstance(el, Text)
+            ).strip()
+        except Exception:
+            return
+        if not text:
+            return
+        try:
+            # bytes on both sides: compare_digest(str, str) raises TypeError
+            # on non-ASCII text (e.g. normal Chinese chat in the session)
+            matched = secrets.compare_digest(text.encode("utf-8"), password.encode("utf-8"))
+        except Exception:
+            matched = False
+        if not matched:
+            return  # not the password: leave the message to normal chat
+        record = self.confirm.latest()
+        if record:
+            # a valid approval: swallow it (the owner asked for no LLM reply
+            # here) and execute in the background
+            event.stop()
+            self.log(f"confirm: password accepted in {sid} for #{record.get('code')}")
+            self._spawn(self._approve_via_password(record, approver_sid=sid))
+            return
+        # nothing to approve: hand the message back to the bot with the secret
+        # replaced by a short placeholder, so chat flows naturally and the
+        # password itself never reaches the model
+        placeholder = (str(self.confirm_cfg.get("template_placeholder") or "").strip()
+                       or DEFAULT_CONFIRM_PLACEHOLDER)
+        if self._redact_password(event, placeholder):
+            self.log(f"confirm: password received in {sid} with nothing pending (redacted)")
+        else:
+            # cannot rewrite the chain -> fail closed rather than leak it
+            event.stop()
+            self.log(f"confirm: password received in {sid}, nothing pending, chain not redactable")
+
+    @staticmethod
+    def _redact_password(event, placeholder: str) -> bool:
+        """Rewrite the password text in place (first Text element becomes the
+        placeholder, the rest are emptied). Returns False when there was
+        nothing safe to rewrite."""
+        try:
+            chain = getattr(getattr(event, "message", None), "chain", None)
+            if chain is None:
+                return False
+            replaced = False
+            for element in chain:
+                if not isinstance(element, Text):
+                    continue
+                element.text = placeholder if not replaced else ""
+                replaced = True
+            return replaced
+        except Exception:
+            return False
+
+    async def _approve_via_password(self, record: dict, approver_sid: str) -> None:
+        """Execute the approved request; ack every confirm session, notify the
+        requesting session."""
+        code = str(record.get("code") or "?")
+        ok_tok, payload = self.confirm.take(str(record.get("token") or ""))
+        if not ok_tok:
+            await self._confirm_send(approver_sid, self._render_tpl(
+                "template_approved", DEFAULT_CONFIRM_APPROVED,
+                action="?", result=f"该请求已处理或已过期（{payload}）",
+                sid="", uid="", code=code))
+            return
+        cap = self._cap(str(payload.get("cap") or ""))
+        act = str(payload.get("action") or "")
+        params = payload.get("params") or {}
+        key = str(payload.get("key") or f"{payload.get('cap')}.{act}")
+        rsid = str(record.get("sid") or "")
+        ruid = str(record.get("uid") or "")
+
+        result = None
+        if cap is None:
+            result = {"ok": False, "error": f"capability '{payload.get('cap')}' no longer exists"}
+        else:
+            # The owner's password elevates past the MODE boundary (level /
+            # high-risk session list / the full-level requirement of control).
+            # Baselines never move: master switch, panic lock, deny/allow/
+            # readonly lists, and the independent control switches.
+            if cap.name == "control":
+                decision = self.engine.evaluate_control(rsid, key, elevated=True)
+            else:
+                decision = self.engine.evaluate(rsid, key, kind="write", elevated=True)
+            if not decision.allowed:
+                result = {"ok": False, "error": f"gate re-check refused: {decision.reason}"}
+                self.audit.write(kind="deny", tool="ops_confirm", domain=cap.name,
+                                 action=act, sid=rsid, uid=ruid, ok=False,
+                                 error=str(decision.reason))
+            else:
+                pre = cap.preflight(act, params)
+                if pre:
+                    result = {"ok": False, "error": f"preflight refused: {pre}"}
+                else:
+                    result = await self._execute_write(cap, act, params, key, rsid, ruid,
+                                                       tool="ops_confirm")
+        ok_flag = bool((result or {}).get("ok"))
+        summary = "成功" if ok_flag else f"失败：{str((result or {}).get('error') or '')[:160]}"
+        self.audit.write(kind="write", tool="ops_confirm", domain=cap.name if cap else "?",
+                         action=act,
+                         target=str(params.get("target") or params.get("plugin_id") or ""),
+                         sid=rsid, uid=ruid, ok=ok_flag,
+                         note=f"approved via confirm session {approver_sid} #{code}",
+                         error="" if ok_flag else str((result or {}).get("error") or ""))
+        remaining = self.confirm.pending_count
+        ack = self._render_tpl("template_approved", DEFAULT_CONFIRM_APPROVED,
+                               action=key, result=summary, sid=rsid, uid=ruid, code=code)
+        if remaining:
+            # one password message approves exactly one request - say so, or the
+            # owner may think everything pending was handled
+            ack += f"\n（仍有 {remaining} 条待确认请求）"
+        # every confirm session gets the outcome, so the others know it is handled
+        for session in self._confirm_sessions():
+            await self._confirm_send(session, ack)
+        await self._notify_session(rsid, self._render_tpl(
+            "template_notice", DEFAULT_CONFIRM_NOTICE, action=key, result=summary, code=code))
+
+    async def _notify_session(self, sid: str, text: str) -> None:
+        """Inject a system notice into the requesting session so its LLM can
+        relay the outcome. publish_notice hands the message to the normal
+        pipeline (the chat plugin buffers it), so flush shortly afterwards
+        to actually trigger a turn."""
+        if not sid:
+            return
+        try:
+            await self.ctx.publish_notice(sid, MessageChain([Text(text)]), is_mentioned=True)
+            await asyncio.sleep(0.8)
+            await self.ctx.flush_session_messages(sid)
+        except Exception as exc:
+            logger.warning(f"[kira_ops] confirm notice to {sid} failed: {exc}")
 
     # ------------------------------------------------------------------
     # request context helpers
@@ -623,19 +944,55 @@ class KiraOpsPlugin(BasePlugin):
         self.audit.write(kind="write", tool="ops_confirm", domain=payload.get("cap", ""),
                          action=payload.get("action", ""), sid=sid, uid=uid,
                          ok=True, note="confirm token issued (pending user approval)")
+        password_on = self._confirm_ready()
+        if password_on:
+            # fire-and-forget: never block the tool result on IM delivery
+            self._spawn(self._send_confirm_challenge(record))
+        next_step = (f"call ops_confirm(token=...) within {self.confirm.ttl}s")
+        if password_on:
+            next_step += "; the owner may also approve with the password in a confirm session"
         return {
             "ok": False,
+            "status": "pending_confirmation",
             "need_confirm": True,
             "token": record["token"],
             "expires_in": self.confirm.ttl,
+            "password_approval": password_on,
             "preview": {
                 "cap": payload.get("cap"),
                 "action": payload.get("action"),
                 "params": self.mask(payload.get("params") or {}),
             },
-            "hint": "高危动作：请在 "
-                    f"{self.confirm.ttl} 秒内调用 ops_confirm(token=...) 确认执行；"
-                    "不确认则自动作废",
+            "next_step": next_step,
+        }
+
+    def _confirm_elevation_needed(self, payload: dict, sid: str, uid: str) -> dict:
+        """A high-risk request that the current mode refuses: instead of a hard
+        denial, ask the owner for a one-off authorization in the confirm DM.
+        No token is handed out - only the owner's password can release this.
+        """
+        record = self.confirm.issue(payload, sid=sid, uid=uid)
+        self.audit.write(kind="write", tool="ops_confirm", domain=payload.get("cap", ""),
+                         action=payload.get("action", ""), sid=sid, uid=uid,
+                         ok=True, note="dm elevation requested (pending owner password)")
+        self._spawn(self._send_confirm_challenge(record))
+        # Tool result only: the requesting session sees nothing, this is data
+        # for the model to reason about. The bot may tell the user whatever it
+        # thinks is appropriate (or stay silent) - the plugin never speaks.
+        return {
+            "ok": False,
+            "status": "pending_owner_approval",
+            "reason": "action exceeds the current capability level",
+            "action": f"{payload.get('cap')}.{payload.get('action')}",
+            "request_code": record.get("code"),
+            "expires_in": self.confirm.ttl,
+            "approval": "requested from the owner's confirm sessions",
+            "on_approval": "the action is executed automatically; this session then receives a notice",
+            "preview": {
+                "cap": payload.get("cap"),
+                "action": payload.get("action"),
+                "params": self.mask(payload.get("params") or {}),
+            },
         }
 
     def _cap(self, domain: str):
@@ -922,6 +1279,9 @@ class KiraOpsPlugin(BasePlugin):
 
         decision = self.engine.evaluate(sid, key, kind="write")
         if not decision.allowed:
+            if decision.high_risk and self._confirm_ready():
+                return self._confirm_elevation_needed(
+                    {"cap": cap.name, "action": act, "params": params, "key": key}, sid, uid)
             return self._deny("ops_config", cap.name, act, sid, uid, decision.reason, params)
         pre = cap.preflight(act, params)
         if pre:
@@ -988,6 +1348,9 @@ class KiraOpsPlugin(BasePlugin):
 
         params = self._normalize_params(domain, args or {}, target)
         if not decision.allowed:
+            if decision.high_risk and self._confirm_ready():
+                return self._confirm_elevation_needed(
+                    {"cap": domain, "action": act, "params": params, "key": key}, sid, uid)
             return self._deny("ops_action", domain, act, sid, uid, decision.reason, params)
 
         pre = cap.preflight(act, params)
@@ -1008,8 +1371,9 @@ class KiraOpsPlugin(BasePlugin):
 
     @register.tool(
         "ops_store",
-        "插件商店：action=search 搜索插件（可带 keyword/author/tag），action=install/update 安装或更新（高危，需令牌），"
-        "action=sources 查看商店源与缓存状态。",
+        "插件商店：action=search 搜索插件（可带 keyword/author/tag），action=install/update 安装或更新，"
+        "action=sources 查看商店源与缓存状态。安装/更新在 standard 档位可直接执行；"
+        "若返回 status=pending_owner_approval 则说明需管理员授权，此时不要重试。",
         {
             "type": "object",
             "properties": {
@@ -1046,6 +1410,11 @@ class KiraOpsPlugin(BasePlugin):
             key = f"store.{act}"
             decision = self.engine.evaluate(sid, key, kind="write")
             if not decision.allowed:
+                if decision.high_risk and self._confirm_ready():
+                    return self._confirm_elevation_needed(
+                        {"cap": "store", "action": act,
+                         "params": {"plugin_id": plugin_id, "force": force or act == "update"},
+                         "key": key}, sid, uid)
                 return self._deny("ops_store", "store", act, sid, uid, decision.reason,
                                   {"plugin_id": plugin_id, "force": force})
             if decision.need_confirm and not confirm:
@@ -1069,7 +1438,9 @@ class KiraOpsPlugin(BasePlugin):
 
     @register.tool(
         "ops_confirm",
-        "用高危动作返回的一次性令牌确认执行。令牌有效期默认 300 秒，同会话同用户才能使用，用后即焚。",
+        "用高危动作返回的一次性令牌确认执行（status=pending_confirmation 时使用）。"
+        "令牌有效期默认 300 秒，同会话同用户才能使用，用后即焚。"
+        "注意：管理员也可以改在确认会话里回复密码批准，届时令牌会作废并返回相应错误，属正常情况。",
         {"type": "object",
          "properties": {"token": {"type": "string", "description": "ops_action/ops_config/ops_store 返回的令牌"}},
          "required": ["token"]}
@@ -1177,6 +1548,7 @@ class KiraOpsPlugin(BasePlugin):
                 "installed": bool(pm and pm.has_plugin("agent")),
                 "enabled": bool(pm and pm.has_plugin("agent") and pm.is_plugin_enabled("agent")),
             },
+            "confirm": self._confirm_status(),
             "lang": self._panel_lang(),
         }
 
@@ -1202,7 +1574,11 @@ class KiraOpsPlugin(BasePlugin):
 
     @register.api(method="GET", path="/config", auth=True)
     async def api_get_config(self):
-        return {"ok": True, "config": self.cfg, "warnings": self.warnings}
+        cfg = copy.deepcopy(self.cfg) if isinstance(self.cfg, dict) else {}
+        confirm = cfg.get("confirm")
+        if isinstance(confirm, dict) and str(confirm.get("password") or ""):
+            confirm["password"] = MASK  # never ship the real password to the browser
+        return {"ok": True, "config": cfg, "warnings": self.warnings}
 
     @register.api(method="POST", path="/config", auth=True)
     async def api_set_config(self, payload: dict):
@@ -1212,6 +1588,15 @@ class KiraOpsPlugin(BasePlugin):
         patch = (payload or {}).get("config") or {}
         if not isinstance(patch, dict):
             return {"ok": False, "error": "config must be a JSON object"}
+        confirm_patch = patch.get("confirm")
+        if isinstance(confirm_patch, dict):
+            pw = str(confirm_patch.get("password") or "").strip()
+            if not pw or pw == MASK:
+                # empty / masked placeholder means "keep the stored password"
+                confirm_patch = dict(confirm_patch)
+                confirm_patch.pop("password", None)
+                patch = dict(patch)
+                patch["confirm"] = confirm_patch
         current = pm.get_plugin_config(self.plugin_id) or {}
         merged = self.deep_merge(current, patch)
         await pm.update_plugin_config(self.plugin_id, merged)

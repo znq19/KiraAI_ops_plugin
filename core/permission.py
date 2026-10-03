@@ -79,8 +79,17 @@ class PermissionEngine:
     # main checks
     # ------------------------------------------------------------------
 
-    def evaluate(self, sid: str, action: str, kind: str = "write") -> Decision:
-        """Check a normal action. kind: 'read' or 'write'."""
+    def evaluate(self, sid: str, action: str, kind: str = "write",
+                 elevated: bool = False) -> Decision:
+        """Check a normal action. kind: 'read' or 'write'.
+
+        ``elevated=True`` is the DM-password approval path: the owner's password
+        authorizes crossing the *mode* boundary (risk level / high-risk session
+        list / confirm requirement) for this one call. It never bypasses the
+        baseline checks - master switch, panic lock, deny/allow lists and the
+        read-only list all still apply, and control actions keep their own
+        independent switches (``evaluate_control`` has no elevation).
+        """
         if not bool(self.master.get("enabled", True)):
             return Decision(False, "kira_ops is disabled in settings")
         if kind == "write" and bool(self.master.get("panic_lock", False)):
@@ -94,24 +103,43 @@ class PermissionEngine:
         if kind == "write" and self._in(sid, self.access.get("readonly_sessions")):
             return Decision(False, "session is read-only")
         if kind == "write" and self.rank < 1:
-            return Decision(False, "risk level 'readonly' forbids writes")
+            if elevated:
+                pass  # the owner's password crosses the mode boundary
+            else:
+                # elevation-eligible only for high-risk actions: a frozen
+                # (readonly) deployment should not spam the owner with
+                # challenges for mundane writes
+                return Decision(False, "risk level 'readonly' forbids writes",
+                                high_risk=self.is_high_risk(action))
 
         high_risk = self.is_high_risk(action)
         if high_risk:
+            if elevated:
+                # approved by the owner via the confirm DM - the mode boundary
+                # (level / session list / token) is waived for this call
+                return Decision(True, "ok (dm-elevated)", high_risk=True)
             if self.rank < 2:
-                return Decision(False, "high-risk action requires level 'dangerous' or 'full'")
+                # high_risk=True marks the refusal as elevation-eligible: the
+                # plugin turns it into a DM authorization request when the
+                # confirm channel is configured
+                return Decision(False, "high-risk action requires level 'dangerous' or 'full'",
+                                high_risk=True)
             hr_sessions = self.risk.get("high_risk_sessions") or []
             if not hr_sessions:
-                return Decision(False, "high_risk_sessions is empty: no session may run high-risk actions")
+                return Decision(False, "high_risk_sessions is empty: no session may run high-risk actions",
+                                high_risk=True)
             if not self._in(sid, hr_sessions):
-                return Decision(False, "session is not in the high-risk session list")
+                return Decision(False, "session is not in the high-risk session list",
+                                high_risk=True)
             if bool(self.risk.get("require_confirm", True)):
                 return Decision(True, "ok", need_confirm=True, high_risk=True)
         return Decision(True, "ok", high_risk=high_risk)
 
-    def evaluate_control(self, sid: str, action: str) -> Decision:
-        """restart / shutdown: independent switch + full level + confirm token."""
-        base = self.evaluate(sid, action, kind="write")
+    def evaluate_control(self, sid: str, action: str, elevated: bool = False) -> Decision:
+        """restart / shutdown: the independent switch is absolute (never
+        elevatable); the full-level requirement is a mode boundary and can be
+        crossed by the owner's DM password (``elevated=True``)."""
+        base = self.evaluate(sid, action, kind="write", elevated=elevated)
         if not base.allowed:
             return base
         if action == "control.restart":
@@ -122,8 +150,12 @@ class PermissionEngine:
                 return Decision(False, "shutdown is disabled in settings")
         else:
             return Decision(False, f"unknown control action: {action}")
+        if elevated:
+            return Decision(True, "ok (dm-elevated)", high_risk=True)
         if self.rank < 3:
-            return Decision(False, "control actions require level 'full'")
+            # marked high_risk so the plugin turns this into a DM
+            # authorization request when the confirm channel is configured
+            return Decision(False, "control actions require level 'full'", high_risk=True)
         return Decision(True, "ok", need_confirm=True, high_risk=True)
 
     # ------------------------------------------------------------------

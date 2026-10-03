@@ -25,8 +25,8 @@ class PluginCap(Capability):
         "enable":     ("write", False, "启用插件"),
         "disable":    ("write", True, "停用插件"),
         "reload":     ("write", False, "热重载插件（重新导入并初始化）"),
-        "install":    ("write", True, "从插件商店安装插件"),
-        "update":     ("write", True, "从插件商店重新安装/更新插件"),
+        "install":    ("write", False, "从插件商店安装插件（standard 可用）"),
+        "update":     ("write", False, "从插件商店重新安装/更新插件（standard 可用）"),
         "uninstall":  ("write", True, "卸载并从磁盘删除插件"),
     }
 

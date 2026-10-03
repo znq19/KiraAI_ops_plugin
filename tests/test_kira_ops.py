@@ -159,6 +159,73 @@ def main():
         assert not d2.allowed
     check("high-risk requires dangerous + listed session + confirm", t_hr_ok)
 
+    # ---- DM elevation: the owner's password crosses the mode boundary -----
+    def t_elevated():
+        e = engine()
+        d = e.evaluate("qq:gm:1", "plugin.uninstall", "write", elevated=True)
+        assert d.allowed and d.high_risk and not d.need_confirm
+        # baseline checks still apply under elevation
+        cfg = dict(base_cfg)
+        cfg["access"] = {"allow_sessions": [], "deny_sessions": ["qq:gm:1"],
+                         "readonly_sessions": []}
+        assert not engine(cfg).evaluate(
+            "qq:gm:1", "plugin.uninstall", "write", elevated=True).allowed
+        cfg2 = dict(base_cfg)
+        cfg2["master"] = {"enabled": True, "panic_lock": True}
+        assert not engine(cfg2).evaluate(
+            "qq:gm:1", "plugin.uninstall", "write", elevated=True).allowed
+        cfg3 = dict(base_cfg)
+        cfg3["access"] = {"allow_sessions": [], "deny_sessions": [],
+                          "readonly_sessions": ["qq:gm:1"]}
+        assert not engine(cfg3).evaluate(
+            "qq:gm:1", "plugin.uninstall", "write", elevated=True).allowed
+        # normal writes are unaffected by the flag
+        assert e.evaluate("qq:gm:1", "plugin.reload", "write", elevated=True).allowed
+    check("elevated crosses the mode boundary but never the baselines", t_elevated)
+
+    # ---- control: switch is absolute, full-level is elevatable ------------
+    def t_control_elevation():
+        cfg = dict(base_cfg)
+        cfg["control"] = {"allow_restart": True, "allow_shutdown": False}
+        cfg["risk"] = dict(base_cfg["risk"], level="standard")
+        e = engine(cfg)
+        d = e.evaluate_control("qq:gm:1", "control.restart")
+        assert not d.allowed and d.high_risk  # refused but elevation-eligible
+        d2 = e.evaluate_control("qq:gm:1", "control.restart", elevated=True)
+        assert d2.allowed and d2.high_risk and not d2.need_confirm
+        # switch off: never elevatable
+        d3 = e.evaluate_control("qq:gm:1", "control.shutdown", elevated=True)
+        assert not d3.allowed and not d3.high_risk
+        # full level keeps the token flow
+        cfg["risk"] = dict(cfg["risk"], level="full")
+        d4 = engine(cfg).evaluate_control("qq:gm:1", "control.restart")
+        assert d4.allowed and d4.need_confirm
+    check("control: switch absolute, full-level elevatable by the owner password",
+          t_control_elevation)
+
+    # ---- readonly level: only high-risk rejections are elevatable ----------
+    def t_readonly_marking():
+        cfg = dict(base_cfg)
+        cfg["risk"] = dict(base_cfg["risk"], level="readonly")
+        e = engine(cfg)
+        d = e.evaluate("qq:gm:1", "plugin.uninstall", "write")
+        assert not d.allowed and d.high_risk          # may be DM-elevated
+        d2 = e.evaluate("qq:gm:1", "plugin.reload", "write")
+        assert not d2.allowed and not d2.high_risk    # mundane writes: no elevation
+        d3 = e.evaluate("qq:gm:1", "plugin.uninstall", "write", elevated=True)
+        assert d3.allowed
+    check("readonly level: high-risk marked elevatable, mundane writes not",
+          t_readonly_marking)
+
+    # ---- high-risk refusals are marked elevation-eligible ------------------
+    def t_high_risk_marked():
+        e = engine()
+        d = e.evaluate("qq:gm:1", "plugin.uninstall", "write")
+        assert not d.allowed and d.high_risk
+        d2 = e.evaluate("qq:gm:1", "plugin.reload", "write")
+        assert d2.allowed and not d2.high_risk
+    check("high-risk refusals carry the elevation-eligible marker", t_high_risk_marked)
+
     # ---- control: independent switches, default off -------------------
     def t_control():
         e = engine()

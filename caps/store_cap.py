@@ -11,8 +11,8 @@ class StoreCap(Capability):
     ACTIONS = {
         "search":   ("read", False, "搜索插件商店"),
         "sources":  ("read", False, "查看商店数据源与缓存状态"),
-        "install":  ("write", True, "从商店安装插件"),
-        "update":   ("write", True, "从商店更新插件"),
+        "install":  ("write", False, "从商店安装插件（standard 可用）"),
+        "update":   ("write", False, "从商店更新插件（standard 可用）"),
     }
 
     async def handle_read(self, action, params):

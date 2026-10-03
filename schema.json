@@ -59,7 +59,7 @@
         "options": ["readonly", "standard", "dangerous", "full"],
         "name": "能力档位",
         "default": "standard",
-        "hint": "readonly=只读；standard=常规读写在控制内（默认）；dangerous=允许高危动作（仍需确认令牌）；full=全开，但重启/关机仍受独立开关约束"
+        "hint": "readonly=只读；standard=常规读写（默认，含插件安装/升级）；超档动作可经密码授权；dangerous=超档动作走高危名单+确认令牌；full=全开，但重启/关机仍受独立开关约束"
       },
       "high_risk_actions": {
         "type": "multi_select",
@@ -75,14 +75,14 @@
         "allow_custom": true,
         "name": "高危动作清单",
         "default": [
-          "plugin.uninstall", "plugin.disable", "plugin.install", "plugin.update",
+          "plugin.uninstall", "plugin.disable",
           "skill.remove", "skill.install",
           "provider.delete_model", "provider.update_model", "provider.sync", "mcp.delete",
           "session.delete", "session.memory_clear",
           "persona.create", "persona.update", "persona.delete", "persona.set_active",
-          "store.install", "store.update", "backup.restore"
+          "backup.restore"
         ],
-        "hint": "勾选哪些动作算高危：需要 dangerous/full 档位 + 高危会话名单 + 确认令牌，三者齐备；建议把 agent.set 也勾上（它会放宽文件/命令策略）"
+        "hint": "勾选哪些动作算超档：standard 下默认被拒；但若已启用「密码确认授权」，任何会话触发这些动作都会向确认会话发起授权，管理员回复密码后即可执行（输了就能用）。未启用密码确认时则需 dangerous/full 档位 + 高危会话名单 + 确认令牌。插件安装/升级已默认移出清单（standard 直接可用），可自行加回"
       },
       "high_risk_sessions": {
         "type": "multi_select",
@@ -102,6 +102,55 @@
         "type": "integer",
         "name": "确认令牌有效期（秒）",
         "default": 300
+      }
+    }
+  },
+  "confirm": {
+    "type": "section",
+    "name": "密码确认授权",
+    "collapsed": false,
+    "fields": {
+      "enabled": {
+        "type": "switch",
+        "name": "启用密码确认授权",
+        "default": false,
+        "hint": "开启后，超档/高危动作不再硬拒：会向确认会话机械发送授权请求；有效期内在任一确认会话直接回复确认密码即批准执行（该条密码消息不会触发 AI 回复）"
+      },
+      "sessions": {
+        "type": "list",
+        "name": "确认会话（可多个，任一批准即可）",
+        "default": [],
+        "hint": "每行一个会话 ID，格式 adapter:dm:QQ号 或 adapter:gm:群号；多个会话会同时收到授权请求，任一回复密码即批准。⚠️ 群会话里密码会以明文出现，建议优先私聊"
+      },
+      "password": {
+        "type": "string",
+        "name": "确认密码",
+        "default": "",
+        "hint": "在任一确认会话中直接发送此密码即批准最近一次待确认的动作；留空则密码确认不可用。模型无法读写本字段（write_deny 内置 password），面板不回显原值"
+      },
+      "template_request": {
+        "type": "string",
+        "name": "确认请求提示语模板",
+        "default": "[kira_ops 高危确认 #{code}]\n会话 {sid} 的用户 {uid} 请求执行高危动作：{action}\n参数：{params}\n如确认执行，请在 {ttl} 秒内于本会话直接回复【确认密码】（只发密码本身，不要带其他文字）；不回复或超时即自动放弃。",
+        "hint": "同时发到所有确认会话的机械提示；可用占位符 {sid} {uid} {action} {params} {ttl} {code}"
+      },
+      "template_placeholder": {
+        "type": "string",
+        "name": "密码占位符（无待确认时）",
+        "default": "[收到 Kira 运行自控台（kira_ops）确认密码，当前并无待确认请求]",
+        "hint": "确认会话里收到正确密码、但当前没有待确认请求时，用这段文字替换密码后交回给 bot；密码本体不会进入模型。留空用内置默认"
+      },
+      "template_approved": {
+        "type": "string",
+        "name": "批准回执模板",
+        "default": "[kira_ops] 高危动作 {action} 已批准并执行：{result}",
+        "hint": "密码正确并执行完成后，发到所有确认会话的回执；可用占位符 {action} {result} {sid} {uid} {code}"
+      },
+      "template_notice": {
+        "type": "string",
+        "name": "原会话通知模板",
+        "default": "[kira_ops 系统通知] 你先前请求的动作 {action} 已获管理员批准并已执行；结果：{result}。本通知仅供你参考，是否向用户说明由你决定。",
+        "hint": "批准后注入发起会话的系统通知（让那边 AI 知晓结果并转述）；可用占位符 {action} {result} {code}"
       }
     }
   },

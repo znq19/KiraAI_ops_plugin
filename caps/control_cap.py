@@ -19,8 +19,8 @@ RESTART_EXIT_CODE = 42
 class ControlCap(Capability):
     name = "control"
     ACTIONS = {
-        "restart":  ("write", True, "重启 KiraAI（需 full 档位 + 独立开关 + 确认令牌）"),
-        "shutdown": ("write", True, "关闭 KiraAI（需 full 档位 + 独立开关 + 确认令牌）"),
+        "restart":  ("write", True, "重启 KiraAI（独立开关必需；另需 full 档位或密码授权）"),
+        "shutdown": ("write", True, "关闭 KiraAI（独立开关必需；另需 full 档位或密码授权）"),
         "info":     ("read", False, "查询重启/关机开关状态"),
     }
 
