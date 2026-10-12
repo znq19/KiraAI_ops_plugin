@@ -222,7 +222,7 @@ def main():
     # ---------------------------------------------------------------- payload fields
     plugin, tmp = load_plugin()
     try:
-        overview = plugin._panel_payload()
+        overview = asyncio.run(plugin._panel_payload())  # rc1 起会话枚举异步化
         backups = {"ok": True, "items": plugin.backups.list(5)}
         audit = {"ok": True, "items": plugin.audit.tail(5)}
         config_resp = {"ok": True, "config": plugin.cfg, "warnings": plugin.warnings}

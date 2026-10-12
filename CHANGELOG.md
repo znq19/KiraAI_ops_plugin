@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1
+
+适配 3.0 rc.1：会话域全异步化 + 模型域语义 + skills/mcp 入口（rc.1 实测三域破坏，多为静默）。
+
+- **会话域**：`get_session_info()` 在 rc.1 已删 ⇒ 会话列举返回空并连锁误判「session not found」；`session_cap` 的 `info`/`memory_count`/`title`/`caps`/`memory_clear`/`delete` 全用已删同步 API；`delete_session` 未 await（丢 coroutine，**没删却报 deleted=true**）；`ctx.get_session_capabilities` 未 await。现全面异步化（分派器本就容忍 awaitable），新增 `_sm_get`/`_sm_count`/`_sm_update_info`/`_sm_clear`/`_sm_caps`/`_sm_caps_update`/`_sm_effective` 双世代助手（`hasattr` + `__await__` 鸭子探测）。**memory_clear 两代都只清对话内容、保留会话标题与能力设置**
+- **模型域**：`models` 列表只显示内部 ID（rc.1 起 key 是 uuid），运维面板读不出模型；`add_model` 拿用户传的展示名比内部 ID 键 ⇒ 注册成功却报 `registered=false`。现显示「可读名 [内部ID]」（同名只显示一次），核对改用 `register_model` 返回值（rc.1 返回内部 ID），2.x 回退原名核对
+- **skills/mcp 域**：`getattr(message_processor, "skills_manager"/"mcp_manager")` 在 rc.1 是 None（规范入口在 `PluginContext.skills_mgr`/`mcp_mgr`）⇒ 两域静默失效 + 删会话后的范围清理静默跳过
+
 ## 1.2.0
 
 新增「私聊密码确认」通道，并按 review 意见调整权限模型：

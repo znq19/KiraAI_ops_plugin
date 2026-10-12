@@ -1,7 +1,7 @@
 {
   "plugin_id": "kira_ops",
   "display_name": "Kira Ops Console",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "AiriLife-ai+znq19",
   "core_version": ">=2.34.6",
   "repo": "https://github.com/znq19/KiraAI_ops_plugin",

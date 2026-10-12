@@ -330,7 +330,10 @@ def main():
 
     # ---- import smoke: decorators registered -----------------------------
     def t_smoke():
-        from core.plugin.plugin_registry import _plugin_components
+        try:
+            from core.plugin.registry import _plugin_components  # 3.0+
+        except ImportError:
+            from core.plugin.plugin_registry import _plugin_components  # 2.x
         comp = _plugin_components.get("kira_ops")
         assert comp is not None, "kira_ops components not registered"
         names = set(comp.tools.keys())

@@ -16,6 +16,24 @@ import json
 import sys
 import types
 from pathlib import Path
+def _ctx_extra() -> dict:
+    """按真实 PluginContext 签名延迟求值（调用时 core 已可导入）：
+    2.x 带 sticker_manager；3.0 改名 sticker_mgr 且新增 7 个必填字段。"""
+    try:
+        import inspect as _i
+        from core.plugin import PluginContext as _P
+        params = _i.signature(_P.__init__).parameters
+        out = {f: None for f in ("prompt_mgr", "skills_mgr", "mcp_mgr", "message_history",
+                                 "image_desc_cache", "session_buffer_mgr", "message_delivery")
+               if f in params}
+        if "sticker_manager" in params:
+            out["sticker_manager"] = None
+        else:
+            out["sticker_mgr"] = None
+        return out
+    except Exception:
+        return {"sticker_manager": None}
+
 from types import SimpleNamespace
 
 FILE = Path(__file__).resolve()
@@ -137,10 +155,21 @@ async def boot():
         db=db, config=kira_config, event_bus=EventBus(Statistics(), asyncio.Queue()),
         provider_mgr=ProviderManager(db, kira_config), tool_mgr=FuncToolManager(kira_config),
         adapter_mgr=adapter_mgr, persona_mgr=PersonaManager(db),
-        session_mgr=SessionManager(db, kira_config), sticker_manager=None,
+        session_mgr=SessionManager(db, kira_config), **_ctx_extra(),
         message_processor=SimpleNamespace(mcp_manager=MCPManager(FuncToolManager(kira_config)),
                                           skills_manager=SkillsManager()))
     owner = SimpleNamespace(adapter_mgr=adapter_mgr)
+
+    # 3.0 的 MessageProcessor.send_message_chain 改经 message_delivery —— 给 owner 补假
+    # delivery，让两代都走「真委托 → 假传输」链路（假 delivery 复刻真实的路由逻辑）
+    class _FakeDelivery:
+        async def send_message_chain(self, session, chain, **kw):
+            parts = session.split(":", maxsplit=2)
+            adapter = adapter_mgr.get_adapter(parts[0])
+            if parts[1] == "dm":
+                return await adapter.send_direct_message(parts[2], chain)
+            return await adapter.send_group_message(parts[2], chain)
+    owner.message_delivery = _FakeDelivery()
 
     async def _send(session, chain):
         return await MessageProcessor.send_message_chain(owner, session, chain)
@@ -152,7 +181,11 @@ async def boot():
         NOTICES.append((session, "".join(getattr(e, "text", "") for e in chain)))
 
     ctx.message_processor.send_message_chain = _send
+    # 统一入口实例级接线：2.x 插件走 message_processor 委托，3.0 走 message_delivery ——
+    # 实例属性直接遮蔽 PluginContext 方法，两代测试都能截获发送
+    ctx.send_message_chain = _send
     ctx.message_processor.flush_session_messages = _flush
+    ctx.flush_session_messages = _flush  # 同上：实例级遮蔽，两代通吃
     ctx.publish_notice = _notice
     pm = PluginManager(ctx)
     ctx.plugin_mgr = pm

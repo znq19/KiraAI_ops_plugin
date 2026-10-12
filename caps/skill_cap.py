@@ -30,6 +30,10 @@ class SkillCap(Capability):
     }
 
     def _sm(self):
+        # 3.0 起规范入口是 PluginContext.skills_mgr；旧路径兜底（特征识别，不绑版本号）
+        sm = getattr(self.ctx, "skills_mgr", None)
+        if sm is not None:
+            return sm
         mp = getattr(self.ctx, "message_processor", None)
         return getattr(mp, "skills_manager", None)
 

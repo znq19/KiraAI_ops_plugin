@@ -270,7 +270,7 @@ class KiraOpsPlugin(BasePlugin):
     def log(self, message: str):
         logger.info(f"[kira_ops] {message}")
 
-    def session_inventory(self) -> tuple:
+    async def session_inventory(self) -> tuple:
         """List sessions, tolerating malformed keys in chat_memory.
 
         ``SessionManager.get_session_info()`` (no argument) splits every key on
@@ -283,6 +283,13 @@ class KiraOpsPlugin(BasePlugin):
         sm = getattr(self.ctx, "session_mgr", None)
         if sm is None:
             return [], []
+        # 世代分流（特征识别）：2.x 有同步 get_session_info；3.0 rc.1 起全异步
+        if not hasattr(sm, "get_session_info"):
+            try:
+                return list(await sm.get_sessions(include_content=False) or []), []
+            except Exception as exc:
+                logger.warning(f"[kira_ops] session enumeration failed: {exc}")
+                return [], []
         try:
             return list(sm.get_session_info() or []), []
         except Exception as exc:
@@ -1124,7 +1131,7 @@ class KiraOpsPlugin(BasePlugin):
             mcp = getattr(getattr(self.ctx, "message_processor", None), "mcp_manager", None)
             out["mcp"] = {"total": len(mcp.servers) if mcp else 0}
         if "sessions" in parts:
-            sessions, skipped = self.session_inventory()
+            sessions, skipped = await self.session_inventory()
             out["sessions"] = {"total": len(sessions)}
             if skipped:
                 out["sessions"]["malformed_keys"] = len(skipped)
@@ -1521,12 +1528,12 @@ class KiraOpsPlugin(BasePlugin):
     def page(self):
         return PluginPage.from_folder("./web")
 
-    def _panel_payload(self):
+    async def _panel_payload(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
         plugins = pm.list_plugins() if pm else []
         sm = getattr(getattr(self.ctx, "message_processor", None), "skills_manager", None)
         mcp = getattr(getattr(self.ctx, "message_processor", None), "mcp_manager", None)
-        sessions, _skipped = self.session_inventory()
+        sessions, _skipped = await self.session_inventory()
         provs = getattr(self.ctx, "provider_mgr", None)
         return {
             "ok": True,
@@ -1570,7 +1577,7 @@ class KiraOpsPlugin(BasePlugin):
 
     @register.api(method="GET", path="/overview", auth=True)
     async def api_overview(self):
-        return self._panel_payload()
+        return await self._panel_payload()
 
     @register.api(method="GET", path="/config", auth=True)
     async def api_get_config(self):

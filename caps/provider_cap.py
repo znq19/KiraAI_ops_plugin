@@ -95,8 +95,19 @@ class ProviderCap(Capability):
             else:
                 # ids only: the full per-model config costs hundreds of chars and
                 # is rarely needed - pass args={"full": true} for it.
+                # 3.0 起 key 是内部稳定 ID（uuid 形态），可读名在 entry["model_name"]：
+                # 展示「可读名 [ID]」（同名时只显示一次），管理操作仍用 ID。
+                def _disp(_models):
+                    out = []
+                    for _mid, _entry in (_models or {}).items():
+                        _name = _entry.get("model_name") if isinstance(_entry, dict) else None
+                        if _name and _name != _mid:
+                            out.append(f"{_name} [{_mid}]")
+                        else:
+                            out.append(str(_mid))
+                    return sorted(out)
                 data = ok(provider_id=pid, counts=counts,
-                          models={str(k): sorted(v or {}) for k, v in models.items()})
+                          models={str(k): _disp(v) for k, v in models.items()})
             if note:
                 data["warning"] = note
             return data
@@ -161,8 +172,13 @@ class ProviderCap(Capability):
             res = pm.register_model(pid, mtype, mid, cfg)
             if hasattr(res, "__await__"):
                 res = await res
-            found = mid in ((pm.get_models(pid) or {}).get(mtype) or {})
-            return ok(provider_id=pid, model_type=mtype, model_id=mid, registered=bool(found))
+            # 3.0 起 register_model 第三参是 model_name，返回生成的内部 ID；
+            # 2.x 返回 None 且 key 即入参。两代分别用正确键核对。
+            internal_id = res if isinstance(res, str) and res else None
+            entries = (pm.get_models(pid) or {}).get(mtype) or {}
+            found = (internal_id in entries) if internal_id else (mid in entries)
+            return ok(provider_id=pid, model_type=mtype, model_id=internal_id or mid,
+                      model_name=mid if internal_id else None, registered=bool(found))
         if action == "update_model":
             mtype = str(params.get("model_type") or "").strip()
             mid = str(params.get("model_id") or "").strip()

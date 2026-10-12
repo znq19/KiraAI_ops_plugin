@@ -26,6 +26,24 @@ import uuid
 import zipfile
 from io import BytesIO
 from pathlib import Path
+def _ctx_extra() -> dict:
+    """按真实 PluginContext 签名延迟求值（调用时 core 已可导入）：
+    2.x 带 sticker_manager；3.0 改名 sticker_mgr 且新增 7 个必填字段。"""
+    try:
+        import inspect as _i
+        from core.plugin import PluginContext as _P
+        params = _i.signature(_P.__init__).parameters
+        out = {f: None for f in ("prompt_mgr", "skills_mgr", "mcp_mgr", "message_history",
+                                 "image_desc_cache", "session_buffer_mgr", "message_delivery")
+               if f in params}
+        if "sticker_manager" in params:
+            out["sticker_manager"] = None
+        else:
+            out["sticker_mgr"] = None
+        return out
+    except Exception:
+        return {"sticker_manager": None}
+
 from types import SimpleNamespace
 
 FILE = Path(__file__).resolve()
@@ -123,7 +141,7 @@ async def boot():
         adapter_mgr=None,
         persona_mgr=PersonaManager(db),
         session_mgr=SessionManager(db, kira_config),
-        sticker_manager=None,
+        **_ctx_extra(),
         message_processor=SimpleNamespace(
             mcp_manager=MCPManager(FuncToolManager(kira_config)),
             skills_manager=SkillsManager()),
@@ -359,7 +377,10 @@ def main():
     def m2_event():
         """The event bus only enqueues; dispatch runs in the lifecycle consumer.
         So assert on the registered hook (name filter + live binding) and run it."""
-        from core.plugin.plugin_handlers import EventType, event_handler_reg
+        try:
+            from core.plugin.handlers import EventType, event_handler_reg  # 3.0+
+        except ImportError:
+            from core.plugin.plugin_handlers import EventType, event_handler_reg  # 2.x
         from plugins.kira_ops.caps import Capability, REGISTRY
 
         class EventCap(Capability):

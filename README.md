@@ -6,7 +6,11 @@
 
 面向所有 KiraAI 部署，不绑定任何特定群、特定用户或特定目录，装上就能用。
 
-- 版本：**1.1.0** ｜ 要求：KiraAI **≥ 2.34.6**（用到 2.34.6 的 `download_file(max_bytes)`、
+- 版本：**1.2.1** ｜ 要求：KiraAI **≥ 2.34.6**，兼容 **3.0 全系列**（含 v3.0.0-rc.1；特征识别，不绑版本号）。
+  v1.2.1 起：会话域适配 rc.1 全异步会话接口（列举/详情/计数/清空/删除/能力读写全部双世代；
+  清空只清对话内容、保留会话元数据）；模型域 `models` 展示带可读名（不再只显示内部 ID）、
+  `add_model` 正确回填 3.0 生成的内部 ID；技能/MCP 域优先走 3.0 规范入口 `ctx.skills_mgr`/`ctx.mcp_mgr`。
+- 旧注：1.1.0 用到 2.34.6 的 `download_file(max_bytes)`、
   2.34.5 的内置 `agent` 插件、2.34.4 的 MCP 单工具开关、2.34.0 的 `multi_select` 动态源）
 - 作者：**AiriLife-ai+znq19** ｜ 仓库：https://github.com/znq19/KiraAI_ops_plugin
 

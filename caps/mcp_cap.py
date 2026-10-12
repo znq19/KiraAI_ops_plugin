@@ -21,6 +21,10 @@ class McpCap(Capability):
     }
 
     def _mgr(self):
+        # 3.0 起规范入口是 PluginContext.mcp_mgr；旧路径兜底（特征识别，不绑版本号）
+        mgr = getattr(self.ctx, "mcp_mgr", None)
+        if mgr is not None:
+            return mgr
         mp = getattr(self.ctx, "message_processor", None)
         return getattr(mp, "mcp_manager", None)
 
