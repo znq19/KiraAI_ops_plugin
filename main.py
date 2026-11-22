@@ -565,12 +565,43 @@ class KiraOpsPlugin(BasePlugin):
             target = await install_skill_from_zip_bytes(
                 get_data_path() / "skills", payload, name, overwrite=overwrite)
         except Exception as exc:
-            return {"ok": False, "error": f"skill install failed: {exc!r}"}
+            code = getattr(exc, "code", "")
+            detail = f"[{code}] {exc}" if code else repr(exc)
+            return {"ok": False, "error": f"skill install failed: {detail}"}
 
         sm = self._skills_manager()
-        if sm is not None:
-            sm.skills_info = sm.scan_skill_dir()
-        return {"ok": True, "name": name, "path": str(target)}
+        if sm is None:
+            # No manager to read the parsed identity from: keep the old contract.
+            return {"ok": True, "name": name, "path": str(target)}
+
+        sm.skills_info = sm.scan_skill_dir()
+        resolved = Path(target).resolve()
+        info = next(
+            (s for s in sm.skills_info if Path(s.path).resolve() == resolved),
+            None,
+        )
+        if info is None:
+            # The archive passed our pre-check but the host still refused it
+            # (e.g. a newer parser): never report a skill that cannot be listed.
+            return {
+                "ok": False,
+                "error": "skill installed to disk but the framework parser did not recognize it",
+                "path": str(target),
+            }
+
+        result = {
+            "ok": True,
+            "name": info.name,
+            "description": info.description,
+            "path": str(target),
+            "enabled": bool(info.enabled),
+        }
+        if info.name != name:
+            result["warning"] = (
+                f"frontmatter name is '{info.name}', not the directory name '{name}'; "
+                "the skill list shows the frontmatter name"
+            )
+        return result
 
     # ------------------------------------------------------------------
     # lifecycle

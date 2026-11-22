@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.4
+
+适配 KiraAI **v3.3.0** 的技能安装契约（不改任何工具 schema / system prompt）。
+
+- **安装前校验**：`install_skill_from_zip_bytes` 在原子替换前用宿主自己的 `SkillsManager.parse_skill_content()`（3.3.0+）校验 staging；失败返回 `ok:false` 并带 `SkillValidationError.code`（`missing_frontmatter` / `invalid_yaml` / `invalid_metadata`），旧版本原封不动。2.x/3.2 回落 `parse_skill_info()`。
+- **正确显示**：安装成功后回读 `SkillInfo`，返回 frontmatter 的 `name/description/enabled`；frontmatter 名与目录名不一致时附 `warning`；装完仍扫描不到则 `ok:false`，不再“返回成功但列表没有”。
+- **正确显示（既有目录）**：磁盘上已存在但解析失败的技能目录仍沿用框架 `scan_skill_dir()` 语义（不显示），不新增 invalid 清单。
+- 新增 `test_330_regressions.py` 4 项（正常安装 / 前导空行拒绝 / 空 description 拒绝 / 覆盖失败保留旧版）。最终：3.3.0 **4/4**，3.2.0 **17/17**，3.2.1 **3/3**，真实集成 **49/49**。
+
 ## 1.2.3
 
 补充适配 KiraAI **v3.2.1**（3.2.0 → 3.2.1 共 12 个上游提交逐项审查）。

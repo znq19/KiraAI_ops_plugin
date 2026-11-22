@@ -372,6 +372,44 @@ def extract_zip_safely(zip_path: Path, staging: Path, *, expected: Optional[str]
 _SKILL_INSTALL_LOCK = threading.Lock()
 
 
+def validate_skill_dir(skill_root: Path) -> None:
+    """Refuse a skill the running framework would not load.
+
+    KiraAI 3.3.0 tightened ``SKILL.md`` parsing: the frontmatter must start at
+    byte 0 (a leading blank line is now rejected) and ``name``/``description``
+    must be non-empty strings. Without this pre-check an archive could be
+    installed "successfully" while the framework silently hides it, and with
+    ``overwrite=True`` it would also have replaced a working version.
+
+    Validation runs on the extracted copy *before* the atomic swap, so a bad
+    archive never touches ``data/skills``. The framework's own parser is used
+    when available (older versions fall back to ``parse_skill_info``), keeping
+    this check identical to what the host applies at scan time.
+    """
+    root = Path(skill_root)
+    skill_md = root / "SKILL.md"
+    if not skill_md.is_file():
+        raise ValueError("SKILL.md was not found at the skill root")
+    try:
+        from core.agent.skills_mgr import SkillsManager
+    except Exception:  # pragma: no cover - framework too old to expose it
+        return
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"SKILL.md is not valid UTF-8: {exc}") from exc
+
+    parser = getattr(SkillsManager, "parse_skill_content", None)
+    if callable(parser):
+        info = parser(text, root)  # raises SkillValidationError(code, message)
+        if not str(getattr(info, "name", "") or "").strip():
+            raise ValueError("SKILL.md declares an empty skill name")
+        return
+    legacy = getattr(SkillsManager, "parse_skill_info", None)
+    if callable(legacy) and legacy(root) is None:
+        raise ValueError("SKILL.md is not recognized by this KiraAI version")
+
+
 def install_skill_dir(skills_root: Path, src_root: Path, skill_name: str,
                       overwrite: bool = False) -> Path:
     """Serialize target replacement; calls run in worker threads, not the loop."""
@@ -440,6 +478,7 @@ async def install_skill_from_zip_bytes(
         zip_path = workspace / "skill.zip"
         await _to_thread(zip_path.write_bytes, zip_bytes)
         root = await _to_thread(extract_zip_safely, zip_path, workspace / "extract")
+        await _to_thread(validate_skill_dir, root)
         return await _to_thread(install_skill_dir, skills_root, root, skill_name, overwrite)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
